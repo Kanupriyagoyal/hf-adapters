@@ -94,17 +94,19 @@ def setup_logging():
 
 
 def require_cuda():
-    """Warn if no CUDA-enabled PyTorch build is available.
+    """Abort early if no CUDA-enabled PyTorch build is available.
 
-    When CUDA is absent the script falls back to CPU execution automatically.
-    A ``RuntimeError`` is still raised if more than one CUDA device is visible
-    (ambiguous which card to use), but a CPU-only environment is accepted.
+    The driver scripts run on an NVIDIA GPU; install a CUDA wheel of torch
+    (e.g. ``pip install torch --index-url https://download.pytorch.org/whl/cu128``)
+    before invoking them.
     """
     if not torch.cuda.is_available():
-        logging.getLogger("TorchOpCollector").warning(
-            "CUDA is not available. Running on CPU."
+        raise RuntimeError(
+            "CUDA is not available. The YAML generators require an NVIDIA GPU "
+            "and a CUDA-enabled build of PyTorch. Install one with, e.g.: "
+            "pip install --upgrade torch --index-url "
+            "https://download.pytorch.org/whl/cu128"
         )
-        return
     if "," in os.getenv("CUDA_VISIBLE_DEVICES", ""):
         raise RuntimeError("CUDA_VISIBLE_DEVICES should specify only one card")
 
@@ -393,7 +395,7 @@ def add_test_case_yaml(
 
     if len(kwmap) > 0:
         if not old_format:
-            test_case_yaml["kwargs"] = kwmap
+            test_case_yaml[inputs]["kwargs"] = kwmap
         else:
             test_case_yaml["kwmap"] = kwmap
 
@@ -421,7 +423,7 @@ class _ArgResult:
 
 
 class TorchOpCollector:
-    DEFAULT_YAML_DEFAULTS = {"dtype": "fp32", "seed": 123, "atol": 5e-3, "rtol": 5e-3}
+    DEFAULT_YAML_DEFAULTS = {"dtype": "fp16", "seed": 123, "atol": 5e-3, "rtol": 5e-3}
 
     graph_id = 0
     op_seq_num = 0
@@ -1779,7 +1781,7 @@ def main():
 
     is_encoder = "bert" in model_path
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     if is_encoder:
         model = AutoModelForMaskedLM.from_pretrained(model_path, device_map="auto")
     else:
@@ -1789,10 +1791,9 @@ def main():
 
     past_key_values = StaticCache(config=model.config, max_cache_len=2048)
 
-    if torch.cuda.is_available():
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
 
     torch._inductor.config.trace.enabled = True
     torch._inductor.config.trace.debug_dir = None
