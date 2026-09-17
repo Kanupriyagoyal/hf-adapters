@@ -154,9 +154,19 @@ _SUPPORTED_DTYPES = [
     "float32",
     "float64",
     "bfloat16",
-    "half",
+    "int8",
+    "int16",
+    "int32",
     "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "complex32",
+    "complex64",
+    "complex128",
     "bool",
+    "half",
 ]
 
 
@@ -544,7 +554,10 @@ class TorchOpCollector:
         # bounding setitem's value tensor (i == 2), which carries no index
         # semantics even when its dtype is integral.
         if op_name in ("torch.getitem", "torch.setitem"):
-            if saved_shape:
+            if i == 1 and "int" in str(dtype) and saved_shape:
+                TorchOpCollector.log_function[TorchOpCollector.log_mthd](
+                    f"i: {i}, saved_shape: {saved_shape}, op_name: {op_name}, dtype: {dtype}, san_args: {san_args}"
+                )
                 return saved_shape[0]
             return TorchOpCollector.DEFAULT_RANDINTLIMIT
         if op_name in TorchOpCollector._INDEX_INTLIMIT_OPS:
