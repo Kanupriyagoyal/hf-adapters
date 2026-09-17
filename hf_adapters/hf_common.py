@@ -25,7 +25,7 @@ import math
 import os
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
@@ -69,6 +69,173 @@ def optional_spyre_config_patch(options: dict[str, Any]) -> Iterator[None]:
 
     with spyre_config.patch(options):
         yield
+
+
+def _move_moe_expert_weight(weight):
+    if not str(DEVICE).startswith("spyre"):
+        return weight
+
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    moved = dma_moe_expert_weight_to_spyre(weight)
+    return moved if moved is not None else weight.to(DEVICE)
+
+
+def prepare_moe_expert_weights(experts):
+    """Split, transpose, and move persistent MoE expert weights in place."""
+    gate_up = experts.gate_up_proj.detach()
+    del experts.gate_up_proj
+
+    intermediate_size = gate_up.shape[1] // 2
+    gate = gate_up[:, :intermediate_size].transpose(1, 2).contiguous()
+    experts.gate_proj = _move_moe_expert_weight(gate)
+    del gate
+
+    up = gate_up[:, intermediate_size:].transpose(1, 2).contiguous()
+    experts.up_proj = _move_moe_expert_weight(up)
+    del up
+    del gate_up
+
+    down = experts.down_proj.detach().transpose(1, 2).contiguous()
+    del experts.down_proj
+    experts.down_proj = _move_moe_expert_weight(down)
+
+
+def moe_topk(probabilities, top_k):
+    """Select experts, widening singleton inputs for Spyre's top-k lowering."""
+    tokens = probabilities.shape[0]
+    topk_input = (
+        probabilities.expand(2, -1).contiguous() if tokens == 1 else probabilities
+    )
+    weights, expert_indices = torch.topk(topk_input, top_k, dim=-1)
+    return weights[:tokens], expert_indices[:tokens]
+
+
+def moe_decode_selected_experts(
+    x,
+    weights,
+    expert_indices,
+    gate,
+    up,
+    down,
+    top_k,
+    tile,
+    stick_size,
+    activation,
+    per_expert_scale_stick=None,
+):
+    """Gather selected experts and combine their decode outputs."""
+    if activation not in ("silu", "gelu_tanh"):
+        raise ValueError(f"unsupported MoE activation: {activation!r}")
+
+    T, H = x.shape
+    if x.device.type == "spyre":
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        # Widen topk's fp16 indices onto a stick before converting them to the
+        # device's int32 gather indices. The layout pass inserts the restickify.
+        index_stick = (
+            expert_indices[..., None].expand(T, top_k, stick_size).contiguous()
+        )
+        index_stick = index_stick.to(torch.float32)
+        index_address = index_stick[..., : stick_size // 2].to(torch.int32)
+        expert_indices = index_address[..., 0]
+        hint = spyre_hint(tiles={"row": tile})
+    else:
+        hint = nullcontext()
+
+    with hint:
+        rows = T * top_k
+        intermediate = gate.shape[-1]
+        inputs = x[:, None, :].expand(T, top_k, H).contiguous().reshape(rows, 1, H)
+        selected_gate = gate[expert_indices].reshape(rows, H, intermediate)
+        selected_up = up[expert_indices].reshape(rows, H, intermediate)
+        selected_down = down[expert_indices].reshape(rows, intermediate, H)
+
+        gate_out = torch.bmm(inputs, selected_gate)
+        up_out = torch.bmm(inputs, selected_up)
+        if activation == "silu":
+            activated = F.silu(gate_out) * up_out
+        else:
+            activated = F.gelu(gate_out, approximate="tanh") * up_out
+        expert_out = torch.bmm(activated, selected_down).reshape(T, top_k, H)
+        expert_out = expert_out * weights[..., None]
+        if per_expert_scale_stick is not None:
+            expert_scale = per_expert_scale_stick[expert_indices][..., :1]
+            expert_out = expert_out * expert_scale
+        return expert_out.sum(dim=1)
+
+
+@contextmanager
+def named_moe_prefill_inputs(x, gate, up, down):
+    """Name eager MoE inputs for the immediately following compiled prefill."""
+    if x.device.type != "spyre":
+        yield
+        return
+
+    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
+    tokens = x.shape[0] * x.shape[1]
+    experts, hidden, intermediate = gate.shape
+    try:
+        for name, extent in (
+            ("E", experts),
+            ("T", tokens),
+            ("H", hidden),
+            ("M", intermediate),
+            ("ONE", 1),
+        ):
+            named_dims.declare_tensor_dim(name, extent)
+        named_dims.name_tensor_dims(x, ["T", "H"])
+        named_dims.name_tensor_dims(gate, ["E", "H", "M"])
+        named_dims.name_tensor_dims(up, ["E", "H", "M"])
+        named_dims.name_tensor_dims(down, ["E", "M", "H"])
+        yield
+    finally:
+        named_dims.reset()
+
+
+def moe_prefill_all_experts(x, routing_weight, gate, up, down, activation):
+    """Evaluate every expert and sum its routed prefill output."""
+    if activation not in ("silu", "gelu_tanh"):
+        raise ValueError(f"unsupported MoE activation: {activation!r}")
+
+    if x.device.type == "spyre":
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+        from torch_spyre._inductor.wsr import for_each_tile
+
+        with spyre_hint(named_dims=["E", "T", "ONE"]):
+            route = routing_weight.permute(1, 0, 2).contiguous().clone()
+
+        def expert_body(acc, tiles):
+            x, route_tile, gate_tile, up_tile, down_tile = tiles
+            gate_out = torch.matmul(x, gate_tile)
+            up_out = torch.matmul(x, up_tile)
+            if activation == "silu":
+                activated = F.silu(gate_out) * up_out
+            else:
+                activated = F.gelu(gate_out, approximate="tanh") * up_out
+            down_out = torch.matmul(activated, down_tile)
+            return acc + (down_out * route_tile).squeeze(0), None
+
+        with spyre_hint(work_div={"T": 32}):
+            result, _ = for_each_tile(
+                expert_body,
+                (x, route, gate, up, down),
+                dims=(None, 0, 0, 0, 0),
+                tile_size=1,
+                init=torch.zeros_like(x),
+            )
+        return result
+
+    gate_out = torch.matmul(x.unsqueeze(0), gate)
+    up_out = torch.matmul(x.unsqueeze(0), up)
+    if activation == "silu":
+        activated = F.silu(gate_out) * up_out
+    else:
+        activated = F.gelu(gate_out, approximate="tanh") * up_out
+    down_out = torch.matmul(activated, down)
+    route = routing_weight.permute(1, 0, 2)
+    return (down_out * route).sum(dim=0)
 
 
 def assert_spyre_dimensions(config, model_name):

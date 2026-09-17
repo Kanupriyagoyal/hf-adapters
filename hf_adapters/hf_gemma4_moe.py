@@ -23,7 +23,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hf_adapters.hf_common import optional_spyre_config_patch, text_config
+from hf_adapters.hf_common import (
+    moe_decode_selected_experts,
+    moe_prefill_all_experts,
+    moe_topk,
+    named_moe_prefill_inputs,
+    optional_spyre_config_patch,
+    prepare_moe_expert_weights,
+    text_config,
+)
 from hf_adapters.hf_gemma4 import (
     Gemma4Attention,
     _gemma4_backbone,
@@ -43,44 +51,9 @@ __all__ = [
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 
 
-def _name_prefill_inputs(x, gate, up, down):
-    from torch_spyre._inductor.wsr.propagate_named_dims import (
-        declare_tensor_dim,
-        name_tensor_dims,
-    )
-
-    tokens = x.shape[0] * x.shape[1]
-    experts, hidden, intermediate = gate.shape
-    for name, extent in (
-        ("E", experts),
-        ("T", tokens),
-        ("H", hidden),
-        ("M", intermediate),
-        ("ONE", 1),
-    ):
-        declare_tensor_dim(name, extent)
-    name_tensor_dims(x, ["T", "H"])
-    name_tensor_dims(gate, ["E", "H", "M"])
-    name_tensor_dims(up, ["E", "H", "M"])
-    name_tensor_dims(down, ["E", "M", "H"])
-
-
-def _reset_named_dims():
-    from torch_spyre._inductor.wsr.propagate_named_dims import reset
-
-    reset()
-
-
 def _router_probs(x, weight, scale, root_size, eps):
     x = _gemma4_rms_norm(x, None, eps)
     return torch.softmax(F.linear(x * scale * root_size, weight), dim=-1)
-
-
-def _topk(probs, top_k):
-    tokens = probs.shape[0]
-    topk_input = probs.expand(2, -1).contiguous() if tokens == 1 else probs
-    weights, expert_indices = torch.topk(topk_input, top_k, dim=-1)
-    return weights[:tokens], expert_indices[:tokens]
 
 
 def _compiled_moe_loop_region(
@@ -89,7 +62,7 @@ def _compiled_moe_loop_region(
     router_proj_w,
     router_scale,
     router_scalar_root_size,
-    per_expert_scale,
+    per_expert_scale_stick,
     gate_dev,
     up_dev,
     down_dev,
@@ -99,9 +72,6 @@ def _compiled_moe_loop_region(
     eps,
 ):
     """Run the routed decode FFN and combine its expert outputs on device."""
-    from torch_spyre._inductor.propagate_hints import spyre_hint
-
-    T, H = x_expert.shape
     probs = _router_probs(
         x_router,
         router_proj_w,
@@ -109,36 +79,21 @@ def _compiled_moe_loop_region(
         router_scalar_root_size,
         eps,
     )
-    weights, expert_indices = _topk(probs, top_k)
+    weights, expert_indices = moe_topk(probs, top_k)
     weights = weights / weights.sum(-1, keepdim=True)
-
-    # Widen topk's fp16 indices onto a stick before converting them to the
-    # device's int32 gather indices. The layout pass inserts the restickify.
-    index_stick = expert_indices[..., None].expand(T, top_k, stick_size).contiguous()
-    index_stick = index_stick.to(torch.float32)
-    index_address = index_stick[..., : stick_size // 2].to(torch.int32)
-    expert_indices = index_address[..., 0]
-
-    with spyre_hint(tiles={"row": tile}):
-        rows = T * top_k
-        intermediate = gate_dev.shape[-1]
-        inputs = (
-            x_expert[:, None, :].expand(T, top_k, H).contiguous().reshape(rows, 1, H)
-        )
-        gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
-        up = up_dev[expert_indices].reshape(rows, H, intermediate)
-        down = down_dev[expert_indices].reshape(rows, intermediate, H)
-
-        gate_out = torch.bmm(inputs, gate)
-        up_out = torch.bmm(inputs, up)
-        activated = F.gelu(gate_out, approximate="tanh") * up_out
-        expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
-
-        # Scale on the H-carrying tensor because bare [T,K] products have no
-        # legal layout. The widened source gives the gather a physical stick.
-        expert_scale = per_expert_scale[expert_indices][..., :1]
-        expert_out = expert_out * weights[..., None] * expert_scale
-        return expert_out.sum(dim=1)
+    return moe_decode_selected_experts(
+        x_expert,
+        weights,
+        expert_indices,
+        gate_dev,
+        up_dev,
+        down_dev,
+        top_k,
+        tile,
+        stick_size,
+        "gelu_tanh",
+        per_expert_scale_stick=per_expert_scale_stick,
+    )
 
 
 def _moe_route_persistent_packed(
@@ -160,7 +115,7 @@ def _moe_route_persistent_packed(
         router_scalar_root_size,
         eps,
     )
-    _, selected = _topk(probs, top_k)
+    _, selected = moe_topk(probs, top_k)
     weights = torch.ops.spyre.keep_by_index(probs, selected, -1, 0.0)
     weights = weights / weights.sum(-1, keepdim=True)
     weights = weights * per_expert_scale
@@ -168,33 +123,6 @@ def _moe_route_persistent_packed(
     # ReLU materializes the expansion; the identity BMM puts it on a stick.
     packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, stick_size))
     return packed @ route_identity
-
-
-def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
-    """Evaluate every expert and sum their routed outputs on device."""
-    from torch_spyre._inductor.propagate_hints import spyre_hint
-    from torch_spyre._inductor.wsr import for_each_tile
-
-    with spyre_hint(named_dims=["E", "T", "ONE"]):
-        route = routing_weight.permute(1, 0, 2).contiguous().clone()
-
-    def expert_body(acc, tiles):
-        x, route_tile, gate_tile, up_tile, down_tile = tiles
-        gate_out = torch.matmul(x, gate_tile)
-        up_out = torch.matmul(x, up_tile)
-        activated = F.gelu(gate_out, approximate="tanh") * up_out
-        down_out = torch.matmul(activated, down_tile)
-        return acc + (down_out * route_tile).squeeze(0), None
-
-    with spyre_hint(work_div={"T": 32}):
-        result, _ = for_each_tile(
-            expert_body,
-            (x_expert, route, gate, up, down),
-            dims=(None, 0, 0, 0, 0),
-            tile_size=1,
-            init=torch.zeros_like(x_expert),
-        )
-    return result
 
 
 class Gemma4MoEBlock(nn.Module):
@@ -369,12 +297,13 @@ class Gemma4MoEBlock(nn.Module):
             router.route_identity,
         )[..., :1]
         experts = self.experts
-        moe_out = _moe_expert_persistent(
+        moe_out = moe_prefill_all_experts(
             expert_input,
             routing_weight,
             experts.gate_proj,
             experts.up_proj,
             experts.down_proj,
+            "gelu_tanh",
         )
         moe_out = _gemma4_rms_norm(
             moe_out.to(residual.dtype).reshape_as(residual),
@@ -409,15 +338,18 @@ class Gemma4MoEBlock(nn.Module):
                 cache_index,
             )
             experts = self.experts
-            _name_prefill_inputs(
+            with named_moe_prefill_inputs(
                 hidden_states,
                 experts.gate_proj,
                 experts.up_proj,
                 experts.down_proj,
-            )
-            with optional_spyre_config_patch({"allow_all_ops_in_lx_planning": True}):
-                hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
-            _reset_named_dims()
+            ):
+                with optional_spyre_config_patch(
+                    {"allow_all_ops_in_lx_planning": True}
+                ):
+                    hidden_states = self._compiled_prefill_ffn(
+                        hidden_states, layer_scalar
+                    )
         else:
             hidden_states, key_cache, value_cache = self._compiled_decode(
                 hidden_states,
@@ -430,32 +362,6 @@ class Gemma4MoEBlock(nn.Module):
             )
 
         return hidden_states, key_cache, value_cache
-
-
-def _move_expert_weight(weight):
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
-
-    moved = dma_moe_expert_weight_to_spyre(weight)
-    return moved if moved is not None else weight.to("spyre")
-
-
-def _prepare_experts(experts):
-    gate_up = experts.gate_up_proj.detach()
-    del experts.gate_up_proj
-
-    intermediate_size = gate_up.shape[1] // 2
-    gate = gate_up[:, :intermediate_size].transpose(1, 2).contiguous()
-    experts.gate_proj = _move_expert_weight(gate)
-    del gate
-
-    up = gate_up[:, intermediate_size:].transpose(1, 2).contiguous()
-    experts.up_proj = _move_expert_weight(up)
-    del up
-    del gate_up
-
-    down = experts.down_proj.detach().transpose(1, 2).contiguous()
-    del experts.down_proj
-    experts.down_proj = _move_expert_weight(down)
 
 
 def prepare_text_decoder_for_spyre(model):
@@ -494,7 +400,7 @@ def prepare_text_decoder_for_spyre(model):
         block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
             expert_scale
         )
-        _prepare_experts(block.experts)
+        prepare_moe_expert_weights(block.experts)
         backbone.layers[i] = block
         blocks.append(block)
 
