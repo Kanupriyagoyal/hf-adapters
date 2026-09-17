@@ -539,19 +539,11 @@ class TorchOpCollector:
             return TorchOpCollector.DEFAULT_RANDINTLIMIT
         if i == 0:
             return TorchOpCollector.DEFAULT_RANDINTLIMIT
-        if op_name == "torch.getitem" and "int" in str(dtype):
-            TorchOpCollector.log_function[TorchOpCollector.log_mthd](
-                f"i: {i}, saved_shape: {saved_shape}, op_name: {op_name}, dtype: {dtype}, san_args: {san_args}"
-            )
         # getitem/setitem: ``a[idx]`` / ``a[idx] = v`` index dim 0 of arg 0, so the
         # index tensor at i == 1 is bounded by saved_shape[0]. Guard on i to avoid
         # bounding setitem's value tensor (i == 2), which carries no index
         # semantics even when its dtype is integral.
         if op_name in ("torch.getitem", "torch.setitem"):
-            if i == 1 and "int" in str(dtype) and saved_shape:
-                TorchOpCollector.log_function[TorchOpCollector.log_mthd](
-                    f"i: {i}, saved_shape: {saved_shape}, op_name: {op_name}, dtype: {dtype}, san_args: {san_args}"
-                )
             if saved_shape:
                 return saved_shape[0]
             return TorchOpCollector.DEFAULT_RANDINTLIMIT
